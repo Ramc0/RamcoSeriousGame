@@ -86,6 +86,11 @@
         const debugCtx = debugCanvas.getContext('2d');
         const gestureStatus = document.getElementById('gestureStatus');
 
+        // ===== NUEVO SISTEMA DE MARCADORES =====
+        let createdMarkers = [];
+        let pinchStartTime = null;
+        const PINCH_HOLD_TIME = 1000; // 1 segundo para crear marcador
+
         // State
         let isDragging = false;
         let isZooming = false;
@@ -156,6 +161,29 @@
             minDetectionConfidence: 0.5,
             minTrackingConfidence: 0.5
         });
+        
+        // ===== DETECCIÓN DE PUÑO =====
+        function isFist(landmarks) {
+            const wrist = landmarks[0];
+
+            const fingerTips = [8, 12, 16, 20];
+
+            let closedFingers = 0;
+
+            fingerTips.forEach(index => {
+                const tip = landmarks[index];
+                const distance = Math.sqrt(
+                    Math.pow(tip.x - wrist.x, 2) +
+                    Math.pow(tip.y - wrist.y, 2)
+                );
+
+                if (distance < 0.18) {
+                    closedFingers++;
+                }
+            });
+
+            return closedFingers >= 3; // al menos 3 dedos cerrados
+        }
 
         hands.onResults((results) => {
             // Draw landmarks
@@ -182,6 +210,25 @@
                         Math.pow(thumbTip.y - indexTip.y, 2)
                     );
                     areHandsClosed.push(distance < 0.08);
+                }
+
+                const fistDetected = isFist(results.multiHandLandmarks[0]);
+
+                // ===== PUÑO PARA CREAR MARCADOR =====
+                if (numHands === 1 && fistDetected) {
+                    if (!pinchStartTime) {
+                        pinchStartTime = Date.now();
+                    } else {
+                        const elapsed = Date.now() - pinchStartTime;
+
+                        if (elapsed > PINCH_HOLD_TIME) {
+                            createMarkerAtCenter();
+                            pinchStartTime = null;
+                        }
+                    }
+
+                    gestureStatus.textContent = "✊ Puño - Creando marcador...";
+                    return;
                 }
 
                 // TWO HANDS CLOSED: Pinch to zoom
@@ -247,8 +294,7 @@
                     }
                 }
                 // ONE HAND CLOSED: Drag to pan
-                else if (numHands >= 1 && areHandsClosed[0]) {
-                    const landmarks = results.multiHandLandmarks[0];
+                else if (numHands >= 1 && areHandsClosed[0] && !fistDetected) {                    const landmarks = results.multiHandLandmarks[0];
                     const thumbTip = landmarks[4];
 
                     if (!isDragging) {
@@ -285,6 +331,7 @@
                     }
                 } else {
                     gestureStatus.textContent = "👋 Hand open";
+                    pinchStartTime = null;
                     isDragging = false;
                     isZooming = false;
                     filteredDistance = null;
@@ -298,8 +345,21 @@
                 filteredDistance = null;
                 filteredHandX = null;
                 filteredHandY = null;
+                pinchStartTime = null;
             }
         });
+        // ===== FUNCION CREAR MARCADOR =====
+        function createMarkerAtCenter() {
+            const center = map.getCenter();
+
+            const marker = L.marker(center).addTo(map)
+                .bindPopup(`Marcador ${createdMarkers.length + 1}`)
+                .openPopup();
+
+            createdMarkers.push(marker);
+
+            console.log("Marcadores creados:", createdMarkers.length);
+        }
 
         const camera = new Camera(videoElement, {
             onFrame: async () => {

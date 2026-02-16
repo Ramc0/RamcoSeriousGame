@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Simulación de robots tipo Roomba (evolutivos)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body{
+      margin:0;
+      background: radial-gradient(circle at top left,#1b2735 0%,#090a0f 40%,#000 100%);
+      height:100vh;
+      color:#eee;
+      font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      overflow:hidden;
+    }
+    #container{ display:flex; width:100vw; height:100vh; padding:16px; gap:16px; }
+    #leftPane{ flex:1 1 auto; display:flex; justify-content:center; align-items:center; }
+    #rightPane{ width:320px; display:flex; flex-direction:column; gap:12px; }
+    #sim{
+      background: radial-gradient(circle at center,#141820 0%,#050609 100%);
+      border-radius:14px;
+      box-shadow:0 0 40px rgba(0,0,0,.8);
+      display:block;
+      width:100%;
+      height:100%;
+    }
+    #chart{
+      background: linear-gradient(135deg,rgba(10,10,20,.96),rgba(5,8,18,.96));
+      border-radius:10px;
+      box-shadow:0 8px 20px rgba(0,0,0,.45);
+    }
+    #info{
+      background: linear-gradient(135deg,rgba(10,10,20,.95),rgba(25,25,45,.96));
+      padding:10px 14px;
+      font-size:12px;
+      border-radius:10px;
+      white-space:pre-line;
+      border:1px solid rgba(120,160,255,.3);
+      box-shadow:0 8px 20px rgba(0,0,0,.4);
+      backdrop-filter: blur(6px);
+    }
+    #info strong{ color:#9cc4ff; }
+  </style>
+</head>
+<body>
+<div id="container">
+  <div id="leftPane"><canvas id="sim"></canvas></div>
+  <div id="rightPane">
+    <div id="info"></div>
+    <canvas id="chart" width="280" height="170"></canvas>
+  </div>
+</div>
+
+<script>
+/* ---------- Configuración básica ---------- */
+const simCanvas   = document.getElementById("sim");
+const simCtx      = simCanvas.getContext("2d");
+const infoDiv     = document.getElementById("info");
+const chartCanvas = document.getElementById("chart");
+const chartCtx    = chartCanvas.getContext("2d");
+
+const margin = 16;
+const SIDEBAR_WIDTH = 320;
+
+simCanvas.width  = window.innerWidth  - SIDEBAR_WIDTH - margin * 3;
+simCanvas.height = window.innerHeight - margin * 2;
+
+const walls = [];
+let cellSize;
+let cols, rows;
+let border = 20;
+
+let GOAL_RADIUS = 35, GOAL_X = 0, GOAL_Y = 0;
+let START_X = 0, START_Y = 0, START_RADIUS = 0;
+
+const NUM_ROBOTS = 50;
+let generation = 1;
+
+let generationTimes = [];
+let generationStartTime = performance.now();
+let bestGenes = null;
+
+const defaultGenes = {
+  radius: 9,
+  speed: 1.8,
+  sensorLength: 95,
+  sensorAngles: [-0.6, -0.25, 0, 0.25, 0.6],
+  turnCooldownMax: 18,
+  baseTurnAngle: 0.45,
+  randomTurnRange: 0.9,
+  hue: 200,
+  colorTurnStrength: 0.06,
+  glowIntensity: 1.0,
+  colorWeights: {
+    wall:  -1.2,
+    goal:   1.0,
+    start:  0.2,
+    fuel:   0.9,   // preferencia por recarga (positivo = atraer, negativo = evitar)
+    empty:  0.0
+  },
+  memoryFade: 0.025,
+  memoryWeight: 0.9
+};
+
+let robots = [];
+
+/* ---------- ENERGÍA y puntos de recarga ---------- */
+const ENERGY_MAX = 100;
+const ENERGY_DRAIN_PER_FRAME = 0.045;
+const DEAD_GREY = { h: 0, s: 0, l: 55 };
+
+const fuels = [];
+let FUEL_RADIUS = 12;
+const FUEL_COUNT = 34;
+const FUEL_GAIN_PER_FRAME = 25;
+const FUEL_ROBOT_COOLDOWN_FRAMES = 8;
+
+/* ---------- Suavizado de glow (attack/release) ---------- */
+const FUEL_GLOW_ATTACK = 0.18;     // subida suave
+const FUEL_GLOW_RELEASE = 0.10;    // bajada suave
+const ROBOT_REFUEL_ATTACK = 0.22;
+const ROBOT_REFUEL_RELEASE = 0.14;
+
+/* ---------- Utilidades geométricas ---------- */
+function segmentIntersection(p0, p1, p2, p3) {
+  const s1x = p1.x - p0.x, s1y = p1.y - p0.y;
+  const s2x = p3.x - p2.x, s2y = p3.y - p2.y;
+  const denom = (-s2x * s1y + s1x * s2y);
+  if (denom === 0) return null;
+  const s = (-s1y * (p0.x - p2.x) + s1x * (p0.y - p2.y)) / denom;
+  const t = ( s2x * (p0.y - p2.y) - s2y * (p0.x - p2.x)) / denom;
+  if (s >= 0 && s <= 1 && t >= 0 && t <= 1) {
+    return { x: p0.x + (t * s1x), y: p0.y + (t * s1y), t, u: s };
+  }
+  return null;
+}
+
+function circleIntersectsRect(cx, cy, radius, rect) {
+  const closestX = Math.max(rect.x, Math.min(cx, rect.x + rect.w));
+  const closestY = Math.max(rect.y, Math.min(cy, rect.y + rect.h));
+  const dx = cx - closestX, dy = cy - closestY;
+  return (dx*dx + dy*dy) < (radius*radius);
+}
+
+function rayCircleIntersection(start, end, cx, cy, r) {
+  const dx = end.x - start.x, dy = end.y - start.y;
+  const fx = start.x - cx, fy = start.y - cy;
+  const a = dx*dx + dy*dy;
+  const b = 2 * (fx*dx + fy*dy);
+  const c = fx*fx + fy*fy - r*r;
+  const disc = b*b - 4*a*c;
+  if (disc < 0) return null;
+  const sqrtD = Math.sqrt(disc);
+  const t1 = (-b - sqrtD) / (2*a);
+  const t2 = (-b + sqrtD) / (2*a);
+  let t = null;
+  if (t1 >= 0 && t1 <= 1) t = t1;
+  else if (t2 >= 0 && t2 <= 1) t = t2;
+  if (t === null) return null;
+  return { t, x: start.x + dx*t, y: start.y + dy*t };
+}
+
+function dist2(ax, ay, bx, by){
+  const dx = ax - bx, dy = ay - by;
+  return dx*dx + dy*dy;
+}
+
+/* ---------- Generación de laberinto (DFS) ---------- */
+function createMaze() {
+  walls.length = 0;
+
+  const W = simCanvas.width, H = simCanvas.height;
+  const targetCell = 80;
+  const usableW = W - 2 * border;
+  const usableH = H - 2 * border;
+
+  cols = Math.max(1, Math.floor(usableW / targetCell));
+  rows = Math.max(1, Math.floor(usableH / targetCell));
+
+  cellSize = Math.min(usableW / cols, usableH / rows);
+
+  const usedW = cols * cellSize;
+  const usedH = rows * cellSize;
+  border = 0.5 * (Math.min(W - usedW, H - usedH));
+
+  const grid = [];
+  for (let y = 0; y < rows; y++) {
+    const row = [];
+    for (let x = 0; x < cols; x++) {
+      row.push({ x, y, visited:false, walls:{ top:true, right:true, bottom:true, left:true }});
+    }
+    grid.push(row);
+  }
+
+  function neighbours(cell) {
+    const list = [];
+    const {x,y} = cell;
+    if (y > 0) list.push(grid[y-1][x]);
+    if (x < cols-1) list.push(grid[y][x+1]);
+    if (y < rows-1) list.push(grid[y+1][x]);
+    if (x > 0) list.push(grid[y][x-1]);
+    return list;
+  }
+
+  function removeWall(a,b){
+    const dx = b.x - a.x, dy = b.y - a.y;
+    if (dx === 1){ a.walls.right=false; b.walls.left=false; }
+    else if (dx === -1){ a.walls.left=false; b.walls.right=false; }
+    else if (dy === 1){ a.walls.bottom=false; b.walls.top=false; }
+    else if (dy === -1){ a.walls.top=false; b.walls.bottom=false; }
+  }
+
+  const stack = [];
+  const startCell = grid[0][0];
+  startCell.visited = true;
+  stack.push(startCell);
+
+  while (stack.length) {
+    const current = stack[stack.length-1];
+    const neigh = neighbours(current).filter(n => !n.visited);
+    if (!neigh.length) stack.pop();
+    else {
+      const next = neigh[Math.floor(Math.random()*neigh.length)];
+      next.visited = true;
+      removeWall(current,next);
+      stack.push(next);
+    }
+  }
+
+  const wallThickness = Math.max(4, cellSize * 0.14);
+  function cellToX(c){ return border + c*cellSize; }
+  function cellToY(r){ return border + r*cellSize; }
+
+  GOAL_X = cellToX(cols-1) + cellSize/2;
+  GOAL_Y = cellToY(rows-1) + cellSize/2;
+  GOAL_RADIUS = cellSize*0.35;
+
+  START_X = cellToX(0) + cellSize/2;
+  START_Y = cellToY(0) + cellSize/2;
+  START_RADIUS = cellSize*0.32;
+
+  for (let y=0;y<rows;y++){
+    for (let x=0;x<cols;x++){
+      const c = grid[y][x];
+      const cx = cellToX(x), cy = cellToY(y);
+
+      if (c.walls.top && y===0) walls.push({x:cx,y:cy,w:cellSize,h:wallThickness});
+      if (c.walls.left && x===0) walls.push({x:cx,y:cy,w:wallThickness,h:cellSize});
+
+      if (c.walls.bottom && y<rows-1) walls.push({x:cx,y:cy+cellSize-wallThickness/2,w:cellSize,h:wallThickness});
+      if (c.walls.right  && x<cols-1) walls.push({x:cx+cellSize-wallThickness/2,y:cy,w:wallThickness,h:cellSize});
+
+      if (y===rows-1 && c.walls.bottom) walls.push({x:cx,y:cy+cellSize-wallThickness,w:cellSize,h:wallThickness});
+      if (x===cols-1 && c.walls.right)  walls.push({x:cx+cellSize-wallThickness,y:cy,w:wallThickness,h:cellSize});
+    }
+  }
+
+  createFuelPoints();
+}
+
+/* ---------- Puntos de recarga ---------- */
+function createFuelPoints(){
+  fuels.length = 0;
+  const minD2FromStart = (cellSize*1.2)*(cellSize*1.2);
+  const minD2FromGoal  = (cellSize*1.2)*(cellSize*1.2);
+
+  const candidates = [];
+  for (let y=0;y<rows;y++){
+    for (let x=0;x<cols;x++){
+      const cx = border + x*cellSize + cellSize/2;
+      const cy = border + y*cellSize + cellSize/2;
+      const d2s = dist2(cx,cy,START_X,START_Y);
+      const d2g = dist2(cx,cy,GOAL_X,GOAL_Y);
+      if (d2s > minD2FromStart && d2g > minD2FromGoal) candidates.push({x:cx,y:cy});
+    }
+  }
+
+  for (let i=candidates.length-1;i>0;i--){
+    const j = Math.floor(Math.random()*(i+1));
+    [candidates[i],candidates[j]] = [candidates[j],candidates[i]];
+  }
+
+  const count = Math.min(FUEL_COUNT, candidates.length);
+  FUEL_RADIUS = Math.max(10, cellSize*0.14);
+
+  for (let i=0;i<count;i++){
+    const p = candidates[i];
+
+    let ok = true;
+    for (const w of walls){
+      if (circleIntersectsRect(p.x,p.y,FUEL_RADIUS*1.05,w)){ ok=false; break; }
+    }
+    if (!ok) continue;
+
+    fuels.push({
+      x: p.x,
+      y: p.y,
+      r: FUEL_RADIUS,
+      activeGlow: 0,          // valor animado 0..1
+      activeGlowTarget: 0     // objetivo por frame (se setea desde robots)
+    });
+  }
+}
+
+/* --- Fuel: NO idle flicker. Solo brilla si alguien recarga, con subida/bajada suave --- */
+function drawFuels(){
+  if (!fuels.length) return;
+
+  simCtx.save();
+
+  for (const f of fuels){
+    // suavizado attack/release hacia target
+    const a = (f.activeGlowTarget > f.activeGlow) ? FUEL_GLOW_ATTACK : FUEL_GLOW_RELEASE;
+    f.activeGlow += (f.activeGlowTarget - f.activeGlow) * a;
+    if (f.activeGlow < 0.0008) f.activeGlow = 0;
+
+    // reset target para el siguiente frame (los robots lo reactivarán si procede)
+    f.activeGlowTarget = 0;
+
+    // base (sin glow)
+    simCtx.globalAlpha = 1;
+    simCtx.beginPath();
+    simCtx.arc(f.x, f.y, f.r, 0, Math.PI*2);
+    simCtx.fillStyle = "rgba(255, 216, 102, 0.10)";
+    simCtx.fill();
+
+    simCtx.lineWidth = 2;
+    simCtx.strokeStyle = "rgba(255, 216, 102, 0.35)";
+    simCtx.stroke();
+
+    // icono base
+    simCtx.globalAlpha = 0.55;
+    simCtx.strokeStyle = "rgba(255, 240, 190, 0.55)";
+    simCtx.lineWidth = 2;
+    simCtx.beginPath();
+    simCtx.moveTo(f.x - f.r*0.35, f.y);
+    simCtx.lineTo(f.x + f.r*0.35, f.y);
+    simCtx.moveTo(f.x, f.y - f.r*0.35);
+    simCtx.lineTo(f.x, f.y + f.r*0.35);
+    simCtx.stroke();
+
+    // glow SOLO si activeGlow > 0
+    if (f.activeGlow > 0.001){
+      const g = f.activeGlow; // 0..1
+      const haloR = f.r * (2.0 + 2.0*g);
+      const grad = simCtx.createRadialGradient(f.x, f.y, f.r*0.2, f.x, f.y, haloR);
+      grad.addColorStop(0, `rgba(255, 216, 102, ${0.75*g})`);
+      grad.addColorStop(1, `rgba(255, 216, 102, 0)`);
+
+      simCtx.globalAlpha = 1;
+      simCtx.fillStyle = grad;
+      simCtx.beginPath();
+      simCtx.arc(f.x, f.y, haloR, 0, Math.PI*2);
+      simCtx.fill();
+
+      simCtx.globalAlpha = 0.95*g;
+      simCtx.lineWidth = 2;
+      simCtx.strokeStyle = "rgba(255, 216, 102, 0.95)";
+      simCtx.beginPath();
+      simCtx.arc(f.x, f.y, f.r, 0, Math.PI*2);
+      simCtx.stroke();
+    }
+  }
+
+  simCtx.restore();
+}
+
+/* ---------- Dibujo del entorno ---------- */
+function drawBackgroundGrid(){
+  simCtx.save();
+  simCtx.globalAlpha = 0.15;
+  simCtx.strokeStyle = "#1f2933";
+  simCtx.lineWidth = 1;
+  for (let x=0;x<=cols;x++){
+    const gx = border + x*cellSize;
+    simCtx.beginPath();
+    simCtx.moveTo(gx,border);
+    simCtx.lineTo(gx,border + rows*cellSize);
+    simCtx.stroke();
+  }
+  for (let y=0;y<=rows;y++){
+    const gy = border + y*cellSize;
+    simCtx.beginPath();
+    simCtx.moveTo(border,gy);
+    simCtx.lineTo(border + cols*cellSize,gy);
+    simCtx.stroke();
+  }
+  simCtx.restore();
+}
+
+function drawWalls(){
+  simCtx.save();
+  simCtx.shadowColor = "rgba(0, 0, 0, 0.8)";
+  simCtx.shadowBlur = 8;
+  simCtx.fillStyle = "#1f3b4d";
+  for (const w of walls) simCtx.fillRect(w.x,w.y,w.w,w.h);
+  simCtx.shadowBlur = 0;
+  simCtx.globalAlpha = 0.4;
+  simCtx.strokeStyle = "#56c7ff";
+  simCtx.lineWidth = 1;
+  for (const w of walls) simCtx.strokeRect(w.x,w.y,w.w,w.h);
+  simCtx.restore();
+}
+
+function drawStart(){
+  simCtx.save();
+  simCtx.globalAlpha = 0.4;
+  const haloR = START_RADIUS * 1.5;
+  const grad = simCtx.createRadialGradient(START_X,START_Y,START_RADIUS*0.3, START_X,START_Y,haloR);
+  grad.addColorStop(0,"rgba(120,220,255,0.6)");
+  grad.addColorStop(1,"rgba(120,220,255,0)");
+  simCtx.fillStyle = grad;
+  simCtx.beginPath(); simCtx.arc(START_X,START_Y,haloR,0,Math.PI*2); simCtx.fill();
+
+  simCtx.globalAlpha = 1;
+  simCtx.beginPath(); simCtx.arc(START_X,START_Y,START_RADIUS,0,Math.PI*2);
+  simCtx.fillStyle = "rgba(120,220,255,0.25)";
+  simCtx.fill();
+  simCtx.lineWidth = 2;
+  simCtx.strokeStyle = "#7fe4ff";
+  simCtx.stroke();
+
+  simCtx.font="12px system-ui";
+  simCtx.fillStyle="#bfefff";
+  simCtx.textAlign="center";
+  simCtx.fillText("INICIO",START_X,START_Y+4);
+  simCtx.restore();
+}
+
+function drawGoal(){
+  simCtx.save();
+  simCtx.globalAlpha = 0.5;
+  const haloR = GOAL_RADIUS * 1.7;
+  const grad = simCtx.createRadialGradient(GOAL_X,GOAL_Y,GOAL_RADIUS*0.3, GOAL_X,GOAL_Y,haloR);
+  grad.addColorStop(0,"rgba(80,255,160,0.7)");
+  grad.addColorStop(1,"rgba(80,255,160,0)");
+  simCtx.fillStyle = grad;
+  simCtx.beginPath(); simCtx.arc(GOAL_X,GOAL_Y,haloR,0,Math.PI*2); simCtx.fill();
+
+  simCtx.globalAlpha = 1;
+  simCtx.beginPath(); simCtx.arc(GOAL_X,GOAL_Y,GOAL_RADIUS,0,Math.PI*2);
+  simCtx.fillStyle="rgba(80,255,160,0.20)";
+  simCtx.fill();
+  simCtx.lineWidth=2;
+  simCtx.strokeStyle="#5affb0";
+  simCtx.stroke();
+
+  simCtx.font="12px system-ui";
+  simCtx.fillStyle="#caffde";
+  simCtx.textAlign="center";
+  simCtx.fillText("META",GOAL_X,GOAL_Y+4);
+  simCtx.restore();
+}
+
+/* ---------- Clase Robot ---------- */
+class Robot{
+  constructor(x,y,genes){
+    const g = genes || defaultGenes;
+
+    this.x = x;
+    this.y = y;
+    this.radius = g.radius;
+    this.angle = Math.random()*Math.PI*2;
+    this.speed = g.speed;
+
+    this.sensorLength = g.sensorLength;
+    this.sensorAngles = g.sensorAngles.slice();
+    this.sensorHits = [];
+
+    this.turnCooldown = 0;
+    this.turnCooldownMax = g.turnCooldownMax;
+    this.baseTurnAngle = g.baseTurnAngle;
+    this.randomTurnRange = g.randomTurnRange;
+
+    this.colorWeights = { ...g.colorWeights };
+    this.colorTurnStrength = g.colorTurnStrength;
+    this.glowIntensity = g.glowIntensity;
+
+    const baseHue = (g.hue !== undefined) ? g.hue : Math.random()*360;
+    this.hue = (baseHue + (Math.random()*60 - 30) + 360) % 360;
+
+    this.history = [];
+    this.historyMax = 40;
+
+    this.memory = [];
+    this.memoryMax = 140;
+    this.memoryFade = g.memoryFade ?? 0.025;
+    this.memoryWeight = g.memoryWeight ?? 0.9;
+    this.memoryDropInterval = 5;
+    this.memoryDropCounter = 0;
+
+    this.energy = ENERGY_MAX;
+    this.dead = false;
+    this.fuelCooldown = 0;
+
+    // <<< NUEVO: glow de recarga suavizado 0..1
+    this.refuelGlow = 0;
+    this.refuelGlowTarget = 0;
+  }
+
+  die(){
+    this.dead = true;
+    this.energy = 0;
+    this.speed = 0;
+    this.glowIntensity = 0;
+    this.colorTurnStrength = 0;
+    this.refuelGlowTarget = 0;
+  }
+
+  tryRefuel(){
+    if (this.dead) return;
+
+    // por defecto: no recarga
+    this.refuelGlowTarget = 0;
+
+    if (this.fuelCooldown > 0){
+      this.fuelCooldown--;
+      return;
+    }
+
+    for (const f of fuels){
+      const r = f.r * 1.35;
+      const d2 = dist2(this.x, this.y, f.x, f.y);
+      if (d2 <= r*r){
+        this.energy = Math.min(ENERGY_MAX, this.energy + FUEL_GAIN_PER_FRAME);
+        this.fuelCooldown = FUEL_ROBOT_COOLDOWN_FRAMES;
+
+        // activar objetivos de glow (robot + punto)
+        this.refuelGlowTarget = 1;
+        f.activeGlowTarget = 1;
+
+        break;
+      }
+    }
+  }
+
+  update(){
+    if (this.dead){
+      // muerto: mantiene sensores pero no se mueve
+      this.checkSensors(true);
+
+      // suavizar el glow de recarga hacia 0
+      this.refuelGlow += (0 - this.refuelGlow) * ROBOT_REFUEL_RELEASE;
+      if (this.refuelGlow < 0.0008) this.refuelGlow = 0;
+      return;
+    }
+
+    this.energy -= ENERGY_DRAIN_PER_FRAME;
+    if (this.energy <= 0){ this.die(); return; }
+
+    const hits = this.checkSensors(false);
+
+    const anyWallHit = hits.some(h => h.hit && h.colorType === "wall");
+    if (anyWallHit && this.turnCooldown === 0){
+      const direction = Math.random() < 0.5 ? -1 : 1;
+      const angleChange = (this.baseTurnAngle + Math.random()*this.randomTurnRange) * direction;
+      this.angle += angleChange;
+      this.turnCooldown = this.turnCooldownMax;
+    }
+
+    if (this.turnCooldown > 0) this.turnCooldown--;
+
+    let steer = 0;
+    if (hits.length > 1){
+      for (let i=0;i<hits.length;i++){
+        const h = hits[i];
+        const side = (i/(hits.length-1))*2 - 1;
+        const w = this.colorWeights[h.colorType] || 0;
+        steer += w * side;
+      }
+    }
+    this.angle += steer * this.colorTurnStrength;
+
+    if (hits.length > 1 && this.memoryWeight > 0){
+      let memSteer = 0;
+      for (let i=0;i<hits.length;i++){
+        const h = hits[i];
+        const side = (i/(hits.length-1))*2 - 1;
+        memSteer += -h.memoryLevel * side;
+      }
+      this.angle += memSteer * this.memoryWeight;
+    }
+
+    const newX = this.x + Math.cos(this.angle)*this.speed;
+    const newY = this.y + Math.sin(this.angle)*this.speed;
+
+    let collided = false;
+    for (const w of walls){
+      if (circleIntersectsRect(newX,newY,this.radius,w)){ collided=true; break; }
+    }
+
+    if (!collided){
+      this.x = newX; this.y = newY;
+    } else {
+      const backX = this.x - Math.cos(this.angle)*this.speed*2;
+      const backY = this.y - Math.sin(this.angle)*this.speed*2;
+      this.x = backX; this.y = backY;
+      this.angle += (Math.random()-0.5)*Math.PI;
+      this.turnCooldown = this.turnCooldownMax;
+    }
+
+    this.history.push({x:this.x,y:this.y});
+    if (this.history.length > this.historyMax) this.history.shift();
+
+    this.memoryDropCounter++;
+    if (this.memoryDropCounter >= this.memoryDropInterval){
+      this.memoryDropCounter = 0;
+      this.memory.push({x:this.x,y:this.y,alpha:1});
+      if (this.memory.length > this.memoryMax) this.memory.shift();
+    }
+    for (let i=this.memory.length-1;i>=0;i--){
+      const m = this.memory[i];
+      m.alpha -= this.memoryFade;
+      if (m.alpha <= 0) this.memory.splice(i,1);
+    }
+
+    // recarga (setea targets)
+    this.tryRefuel();
+
+    // suavizado del glow de recarga hacia target (attack/release)
+    const a = (this.refuelGlowTarget > this.refuelGlow) ? ROBOT_REFUEL_ATTACK : ROBOT_REFUEL_RELEASE;
+    this.refuelGlow += (this.refuelGlowTarget - this.refuelGlow) * a;
+    if (this.refuelGlow < 0.0008) this.refuelGlow = 0;
+  }
+
+  checkSensors(isDead){
+    this.sensorHits = [];
+    const memoryRadius = 32;
+    const memoryRadius2 = memoryRadius*memoryRadius;
+
+    for (const relAngle of this.sensorAngles){
+      const sensorDir = this.angle + relAngle;
+      const start = {x:this.x,y:this.y};
+      const end = {x:this.x + Math.cos(sensorDir)*this.sensorLength,
+                   y:this.y + Math.sin(sensorDir)*this.sensorLength};
+
+      let bestT = Infinity;
+      let bestPoint = null;
+      let bestType = "empty";
+
+      for (const w of walls){
+        const edges = [
+          {a:{x:w.x,y:w.y}, b:{x:w.x+w.w,y:w.y}},
+          {a:{x:w.x,y:w.y+w.h}, b:{x:w.x+w.w,y:w.y+w.h}},
+          {a:{x:w.x,y:w.y}, b:{x:w.x,y:w.y+w.h}},
+          {a:{x:w.x+w.w,y:w.y}, b:{x:w.x+w.w,y:w.y+w.h}}
+        ];
+        for (const edge of edges){
+          const result = segmentIntersection(start,end,edge.a,edge.b);
+          if (result && result.t < bestT){
+            bestT = result.t;
+            bestPoint = {x:result.x,y:result.y};
+            bestType = "wall";
+          }
+        }
+      }
+
+      const hitGoal = rayCircleIntersection(start,end,GOAL_X,GOAL_Y,GOAL_RADIUS);
+      if (hitGoal && hitGoal.t < bestT){
+        bestT = hitGoal.t; bestPoint = {x:hitGoal.x,y:hitGoal.y}; bestType="goal";
+      }
+
+      const hitStart = rayCircleIntersection(start,end,START_X,START_Y,START_RADIUS);
+      if (hitStart && hitStart.t < bestT){
+        bestT = hitStart.t; bestPoint = {x:hitStart.x,y:hitStart.y}; bestType="start";
+      }
+
+      for (const f of fuels){
+        const hitFuel = rayCircleIntersection(start,end,f.x,f.y,f.r*1.05);
+        if (hitFuel && hitFuel.t < bestT){
+          bestT = hitFuel.t; bestPoint = {x:hitFuel.x,y:hitFuel.y}; bestType="fuel";
+        }
+      }
+
+      const probePoint = bestPoint || end;
+      let memoryLevel = 0;
+      if (!isDead){
+        for (const m of this.memory){
+          const dx = m.x - probePoint.x;
+          const dy = m.y - probePoint.y;
+          const d2 = dx*dx + dy*dy;
+          if (d2 <= memoryRadius2) memoryLevel = Math.max(memoryLevel, m.alpha);
+        }
+      }
+
+      this.sensorHits.push({
+        angle: sensorDir,
+        hit: !!bestPoint,
+        from: start,
+        to: bestPoint || end,
+        colorType: bestType,
+        memoryLevel
+      });
+    }
+    return this.sensorHits;
+  }
+
+  hasReachedGoal(){
+    if (this.dead) return false;
+    const d2 = dist2(this.x,this.y,GOAL_X,GOAL_Y);
+    return d2 < (GOAL_RADIUS*GOAL_RADIUS);
+  }
+
+  drawTrail(ctx){
+    if (this.dead) return;
+    if (this.history.length < 2) return;
+    ctx.save();
+    for (let i=1;i<this.history.length;i++){
+      const p0=this.history[i-1], p1=this.history[i];
+      const t=i/(this.history.length-1);
+      const alpha = 0.01 + 2*t;
+      const lightness = 35 + 25*t;
+      ctx.strokeStyle = `hsla(${this.hue}, 80%, ${lightness}%, ${alpha})`;
+      ctx.lineWidth = 1 + 0.7*t;
+      ctx.beginPath();
+      ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  drawMemory(ctx){
+    if (this.dead) return;
+    if (!this.memory.length) return;
+    ctx.save();
+    for (const m of this.memory){
+      const r = this.radius * 1.4;
+      const grad = ctx.createRadialGradient(m.x,m.y,0, m.x,m.y,r*2.4);
+      grad.addColorStop(0, `hsla(${this.hue}, 85%, 70%, ${0.35*m.alpha})`);
+      grad.addColorStop(1, `hsla(${this.hue}, 60%, 35%, 0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(m.x,m.y,r*2.4,0,Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  draw(ctx){
+    this.drawMemory(ctx);
+
+    const energyRatio = Math.max(0, Math.min(1, this.energy / ENERGY_MAX));
+    const rg = this.refuelGlow; // 0..1 (suavizado)
+
+    // Glow (normal + refuel overlay)
+    if (!this.dead){
+      // glow normal (azul/hue)
+      ctx.save();
+      const baseGlowR = this.radius * (1.1 + 0.5*this.glowIntensity);
+      ctx.globalAlpha = 0.15 + 0.15*this.glowIntensity;
+      ctx.shadowColor = `hsla(${this.hue}, 100%, 70%, 0.9)`;
+      ctx.shadowBlur = 6 + 10*this.glowIntensity;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, baseGlowR, 0, Math.PI*2);
+      ctx.fillStyle = `hsla(${this.hue}, 90%, 55%, 0.55)`;
+      ctx.fill();
+      ctx.restore();
+
+      // glow de recarga (amarillo) con rampa suave
+      if (rg > 0.001){
+        ctx.save();
+        const boostR = this.radius * (1.5 + 2.6*rg);
+        ctx.globalAlpha = 0.10 + 0.60*rg;
+        ctx.shadowColor = "rgba(255, 216, 102, 0.95)";
+        ctx.shadowBlur  = 14 + 32*rg;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, boostR, 0, Math.PI*2);
+        ctx.fillStyle = `rgba(255, 216, 102, ${0.25 + 0.55*rg})`;
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    this.drawTrail(ctx);
+
+    // Sensores
+    ctx.save();
+    ctx.globalAlpha = this.dead ? 0.18 : 0.4;
+    for (const s of this.sensorHits){
+      ctx.beginPath();
+      ctx.moveTo(s.from.x,s.from.y);
+      ctx.lineTo(s.to.x,s.to.y);
+
+      let stroke;
+      if (s.colorType === "wall") stroke = this.dead ? "rgba(160,160,160,0.35)" : `hsla(${this.hue}, 70%, 55%, 0.7)`;
+      else if (s.colorType === "goal") stroke = "rgba(80, 255, 160, 0.9)";
+      else if (s.colorType === "start") stroke = "rgba(120, 220, 255, 0.9)";
+      else if (s.colorType === "fuel") stroke = "rgba(255, 216, 102, 0.95)";
+      else stroke = this.dead ? "rgba(140,140,140,0.22)" : `hsla(${this.hue}, 40%, 40%, 0.45)`;
+
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Cuerpo
+    ctx.save();
+    ctx.translate(this.x,this.y);
+    ctx.rotate(this.angle);
+
+    let fillStyle;
+    if (this.dead){
+      const {h,s,l} = DEAD_GREY;
+      const innerGrad = ctx.createRadialGradient(0,0,this.radius*0.1, 0,0,this.radius);
+      innerGrad.addColorStop(0, `hsl(${h}, ${s}%, ${Math.min(80,l+20)}%)`);
+      innerGrad.addColorStop(1, `hsl(${h}, ${s}%, ${l}%)`);
+      fillStyle = innerGrad;
+    } else {
+      // mezcla suave hacia amarillo cuando recarga
+      const innerGrad = ctx.createRadialGradient(0,0,this.radius*0.1, 0,0,this.radius);
+
+      // centro: mezcla entre blanco-azulado y blanco-amarillo
+      const c0 = (rg > 0)
+        ? `rgba(255, 245, 200, ${0.65*rg})`
+        : `rgba(255,255,255,0)`;
+      const n0 = `hsl(${this.hue}, 80%, 75%)`;
+
+      // borde: mezcla entre hue normal y amarillo
+      const c1 = (rg > 0)
+        ? `rgba(255, 196, 70, ${0.85*rg})`
+        : `rgba(255,255,255,0)`;
+      const n1 = `hsl(${this.hue}, 60%, 35%)`;
+
+      innerGrad.addColorStop(0, n0);
+      innerGrad.addColorStop(0.001, n0);
+      innerGrad.addColorStop(0.20, c0); // overlay centro
+      innerGrad.addColorStop(1, n1);
+      innerGrad.addColorStop(0.999, n1);
+      innerGrad.addColorStop(1, c1);    // overlay borde
+
+      fillStyle = innerGrad;
+    }
+
+    ctx.beginPath();
+    ctx.arc(0,0,this.radius,0,Math.PI*2);
+    ctx.fillStyle = fillStyle;
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = this.dead ? "rgba(0,0,0,0.35)" : "rgba(0,0,0,0.7)";
+    ctx.stroke();
+
+    // bisel
+    ctx.beginPath();
+    ctx.arc(0,0,this.radius*0.65,-Math.PI*0.1,Math.PI*1.1);
+    ctx.fillStyle = this.dead ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.25)";
+    ctx.fill();
+
+    // frente
+    ctx.beginPath();
+    ctx.moveTo(this.radius*0.3,0);
+    ctx.lineTo(this.radius*0.95,0);
+    ctx.strokeStyle = this.dead ? "rgba(255,255,255,0.22)" : "#ffffff";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.restore();
+
+    // aro energía
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.radius + 3.2, -Math.PI/2, -Math.PI/2 + Math.PI*2*energyRatio);
+    ctx.strokeStyle = this.dead
+      ? "rgba(180,180,180,0.25)"
+      : (rg > 0.01 ? `rgba(255,216,102,${0.35 + 0.55*rg})` : `hsla(${this.hue}, 95%, 72%, 0.55)`);
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ---------- Evolución ---------- */
+function mutateValue(value, factor, minVal, maxVal){
+  const delta = (Math.random()*2 - 1)*factor;
+  let v = value*(1+delta);
+  if (minVal !== undefined) v = Math.max(minVal,v);
+  if (maxVal !== undefined) v = Math.min(maxVal,v);
+  return v;
+}
+
+function mutateHue(hue, range=40){
+  let h = hue + (Math.random()*2 - 1)*range;
+  h %= 360;
+  if (h < 0) h += 360;
+  return h;
+}
+
+function mutateColorWeights(parentWeights){
+  const result = {};
+  const keys = ["wall","goal","start","fuel","empty"];
+  for (const k of keys){
+    const base = (parentWeights[k] !== undefined) ? parentWeights[k] : 0;
+    result[k] = mutateValue(base, 0.35, -3.0, 3.0);
+  }
+  return result;
+}
+
+function mutateGenes(parent){
+  const g = {
+    radius: mutateValue(parent.radius, 0.2, 4, 22),
+    speed: mutateValue(parent.speed, 0.22, 0.5, 4.0),
+    sensorLength: mutateValue(parent.sensorLength, 0.25, 40, 260),
+    turnCooldownMax: Math.round(mutateValue(parent.turnCooldownMax, 0.3, 5, 80)),
+    baseTurnAngle: mutateValue(parent.baseTurnAngle, 0.25, 0.08, 1.2),
+    randomTurnRange: mutateValue(parent.randomTurnRange, 0.3, 0.2, 2.5),
+    sensorAngles: parent.sensorAngles.slice(),
+    hue: mutateHue(parent.hue !== undefined ? parent.hue : 200, 40),
+    colorTurnStrength: mutateValue(parent.colorTurnStrength || 0.06, 0.3, 0.01, 0.2),
+    glowIntensity: mutateValue(parent.glowIntensity || 1.0, 0.4, 0.1, 2.0),
+    colorWeights: mutateColorWeights(parent.colorWeights || defaultGenes.colorWeights),
+    memoryFade: mutateValue(parent.memoryFade || 0.025, 0.3, 0.005, 0.08),
+    memoryWeight: mutateValue(parent.memoryWeight || 0.9, 0.35, 0.0, 1.5)
+  };
+
+  for (let i=0;i<g.sensorAngles.length;i++){
+    g.sensorAngles[i] += (Math.random()*2 - 1)*0.09;
+  }
+  g.sensorAngles.sort((a,b)=>a-b);
+  return g;
+}
+
+function extractGenesFromRobot(robot){
+  return {
+    radius: robot.radius,
+    speed: robot.speed,
+    sensorLength: robot.sensorLength,
+    sensorAngles: robot.sensorAngles.slice(),
+    turnCooldownMax: robot.turnCooldownMax,
+    baseTurnAngle: robot.baseTurnAngle,
+    randomTurnRange: robot.randomTurnRange,
+    hue: robot.hue,
+    colorTurnStrength: robot.colorTurnStrength,
+    glowIntensity: robot.glowIntensity,
+    colorWeights: { ...robot.colorWeights },
+    memoryFade: robot.memoryFade,
+    memoryWeight: robot.memoryWeight
+  };
+}
+
+/* ---------- Colisiones robot-robot (no se solapan) ---------- */
+function resolveRobotCollisions(){
+  const cell = Math.max(18, cellSize * 0.35);
+  const inv = 1 / cell;
+
+  const buckets = new Map();
+  function key(ix,iy){ return (ix<<16) ^ (iy & 0xffff); }
+
+  for (let i=0;i<robots.length;i++){
+    const r = robots[i];
+    const ix = Math.floor(r.x * inv);
+    const iy = Math.floor(r.y * inv);
+    const k = key(ix,iy);
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(i);
+  }
+
+  for (let i=0;i<robots.length;i++){
+    const a = robots[i];
+    const aix = Math.floor(a.x * inv);
+    const aiy = Math.floor(a.y * inv);
+
+    for (let dy=-1;dy<=1;dy++){
+      for (let dx=-1;dx<=1;dx++){
+        const k = key(aix+dx, aiy+dy);
+        const list = buckets.get(k);
+        if (!list) continue;
+
+        for (const j of list){
+          if (j <= i) continue;
+          const b = robots[j];
+
+          const minDist = a.radius + b.radius;
+          const dxp = b.x - a.x;
+          const dyp = b.y - a.y;
+          const d2 = dxp*dxp + dyp*dyp;
+
+          if (d2 === 0) continue;
+          if (d2 >= minDist*minDist) continue;
+
+          const d = Math.sqrt(d2);
+          const overlap = (minDist - d);
+
+          const nx = dxp / d;
+          const ny = dyp / d;
+
+          let axMove = 0, ayMove = 0, bxMove = 0, byMove = 0;
+
+          if (a.dead && b.dead){
+            continue;
+          } else if (a.dead && !b.dead){
+            bxMove = nx * overlap;
+            byMove = ny * overlap;
+          } else if (!a.dead && b.dead){
+            axMove = -nx * overlap;
+            ayMove = -ny * overlap;
+          } else {
+            axMove = -nx * (overlap * 0.5);
+            ayMove = -ny * (overlap * 0.5);
+            bxMove =  nx * (overlap * 0.5);
+            byMove =  ny * (overlap * 0.5);
+          }
+
+          if (axMove || ayMove){
+            const px = a.x, py = a.y;
+            a.x += axMove; a.y += ayMove;
+            let hitWall = false;
+            for (const w of walls){
+              if (circleIntersectsRect(a.x,a.y,a.radius,w)){ hitWall=true; break; }
+            }
+            if (hitWall){ a.x = px; a.y = py; }
+          }
+
+          if (bxMove || byMove){
+            const px = b.x, py = b.y;
+            b.x += bxMove; b.y += byMove;
+            let hitWall = false;
+            for (const w of walls){
+              if (circleIntersectsRect(b.x,b.y,b.radius,w)){ hitWall=true; break; }
+            }
+            if (hitWall){ b.x = px; b.y = py; }
+          }
+        }
+      }
+    }
+  }
+}
+
+/* ---------- Gestión de simulación ---------- */
+function resetSimulation(){
+  robots = [];
+  const parentGenes = bestGenes || defaultGenes;
+
+  createMaze();
+
+  const startCellX = START_X;
+  const startCellY = START_Y;
+  const spread = cellSize * 0.25;
+
+  for (let i=0;i<NUM_ROBOTS;i++){
+    const genes = mutateGenes(parentGenes);
+    const startX = startCellX + (Math.random()*2 - 1)*spread;
+    const startY = startCellY + (Math.random()*2 - 1)*spread;
+    robots.push(new Robot(startX,startY,genes));
+  }
+
+  generationStartTime = performance.now();
+}
+
+function updateInfo(){
+  let alive = 0, dead = 0;
+  for (const r of robots){ r.dead ? dead++ : alive++; }
+
+  let text = `<strong>Generación:</strong> ${generation}
+Robots: ${NUM_ROBOTS}  (vivos: ${alive}, muertos: ${dead})
+Puntos recarga: ${fuels.length}`;
+
+  if (bestGenes && generationTimes.length > 0){
+    const lastTime = generationTimes[generationTimes.length-1];
+    const bestTime = Math.min(...generationTimes);
+    const cw = bestGenes.colorWeights || {};
+
+    text += `
+
+<strong>Mejores genes (ganador generación anterior):</strong>
+· color (hue): ${bestGenes.hue.toFixed(1)}°
+· radio: ${bestGenes.radius.toFixed(2)}
+· velocidad: ${bestGenes.speed.toFixed(2)}
+· longitud sensores: ${bestGenes.sensorLength.toFixed(1)}
+· enfriamiento giro: ${bestGenes.turnCooldownMax}
+· ángulo base giro: ${bestGenes.baseTurnAngle.toFixed(2)}
+· rango giro aleatorio: ${bestGenes.randomTurnRange.toFixed(2)}
+· fuerza giro por color: ${bestGenes.colorTurnStrength.toFixed(3)}
+· glow: ${bestGenes.glowIntensity.toFixed(2)}
+· memoria fade: ${bestGenes.memoryFade.toFixed(3)}
+· peso memoria: ${bestGenes.memoryWeight.toFixed(2)}
+
+<strong>Respuesta a colores:</strong>
+· pared (wall): ${ (cw.wall ?? 0).toFixed(2) }
+· meta  (goal): ${ (cw.goal ?? 0).toFixed(2) }
+· inicio(start): ${ (cw.start ?? 0).toFixed(2) }
+· recarga(fuel): ${ (cw.fuel ?? 0).toFixed(2) }
+· vacío(empty): ${ (cw.empty ?? 0).toFixed(2) }
+
+Tiempo última generación: ${lastTime.toFixed(2)} s
+Mejor tiempo histórico: ${bestTime.toFixed(2)} s`;
+  } else {
+    text += `
+
+<strong>Mejores genes:</strong> ninguno todavía (evolucionando...)`;
+  }
+
+  infoDiv.innerHTML = text;
+}
+
+/* ---------- Gráfico ---------- */
+function drawChart(){
+  chartCtx.clearRect(0,0,chartCanvas.width,chartCanvas.height);
+  if (!generationTimes.length) return;
+
+  const chartWidth  = chartCanvas.width;
+  const chartHeight = chartCanvas.height;
+
+  const padding = 10;
+  const innerX = 40;
+  const innerY = 26;
+  const innerWidth  = chartWidth - innerX - padding;
+  const innerHeight = chartHeight - innerY - 18;
+
+  const bgGrad = chartCtx.createLinearGradient(0,0,0,chartHeight);
+  bgGrad.addColorStop(0,"rgba(10,16,30,0.96)");
+  bgGrad.addColorStop(1,"rgba(5,8,18,0.96)");
+  chartCtx.fillStyle = bgGrad;
+  chartCtx.fillRect(0,0,chartWidth,chartHeight);
+
+  chartCtx.strokeStyle = "rgba(120,160,255,0.7)";
+  chartCtx.lineWidth = 1;
+  chartCtx.strokeRect(0.5,0.5,chartWidth-1,chartHeight-1);
+
+  chartCtx.fillStyle = "#e5eeff";
+  chartCtx.font = "11px system-ui";
+  chartCtx.textAlign = "left";
+  chartCtx.fillText("Tiempo hasta la meta (s)", 8, 16);
+
+  const maxBars = 30;
+  const data = generationTimes.slice(-maxBars);
+  const maxTime = Math.max(...data);
+  const minTime = Math.min(...data);
+  const bestTime = Math.min(...generationTimes);
+
+  chartCtx.strokeStyle = "rgba(255,255,255,0.08)";
+  chartCtx.lineWidth = 1;
+  const gridLines = 4;
+  for (let i=0;i<=gridLines;i++){
+    const gy = innerY + (innerHeight/gridLines)*i;
+    chartCtx.beginPath();
+    chartCtx.moveTo(innerX,gy);
+    chartCtx.lineTo(innerX+innerWidth,gy);
+    chartCtx.stroke();
+  }
+
+  chartCtx.strokeStyle = "rgba(200,220,255,0.6)";
+  chartCtx.beginPath();
+  chartCtx.moveTo(innerX,innerY);
+  chartCtx.lineTo(innerX,innerY+innerHeight);
+  chartCtx.lineTo(innerX+innerWidth,innerY+innerHeight);
+  chartCtx.stroke();
+
+  chartCtx.fillStyle = "#c5d7ff";
+  chartCtx.textAlign = "right";
+  chartCtx.fillText(maxTime.toFixed(1), innerX-4, innerY+9);
+  chartCtx.fillText(minTime.toFixed(1), innerX-4, innerY+innerHeight);
+
+  const barCount = data.length;
+  const barGap = 2;
+  const barWidth = Math.max(3, (innerWidth - barGap*(barCount-1))/barCount);
+
+  chartCtx.textAlign = "center";
+  for (let i=0;i<barCount;i++){
+    const t = data[i];
+    const norm = t / maxTime;
+    const barH = norm * innerHeight;
+    const x = innerX + i*(barWidth+barGap);
+    const y = innerY + innerHeight - barH;
+
+    const gGlobalIndex = generationTimes.length - data.length + i;
+    const isBest = generationTimes[gGlobalIndex] === bestTime;
+
+    const grad = chartCtx.createLinearGradient(x,y,x,y+barH);
+    if (isBest){
+      grad.addColorStop(0,"rgba(102,255,204,0.95)");
+      grad.addColorStop(1,"rgba(46,204,113,0.85)");
+    } else {
+      grad.addColorStop(0,"rgba(80,190,255,0.95)");
+      grad.addColorStop(1,"rgba(0,118,210,0.85)");
+    }
+    chartCtx.fillStyle = grad;
+    chartCtx.fillRect(x,y,barWidth,barH);
+
+    if ((i+1)%5===0 || i===barCount-1){
+      const genIndex = generationTimes.length - data.length + i + 1;
+      chartCtx.fillStyle = "#dde6ff";
+      chartCtx.font = "9px system-ui";
+      chartCtx.fillText(genIndex, x + barWidth/2, innerY + innerHeight + 11);
+    }
+  }
+}
+
+/* ---------- Bucle principal ---------- */
+function loop(){
+  simCtx.clearRect(0,0,simCanvas.width,simCanvas.height);
+
+  drawBackgroundGrid();
+  drawWalls();
+  drawStart();
+  drawGoal();
+  drawFuels();
+
+  let winner = null;
+
+  for (const r of robots) r.update();
+  resolveRobotCollisions();
+
+  for (const r of robots){
+    r.draw(simCtx);
+    if (!winner && r.hasReachedGoal()) winner = r;
+  }
+
+  if (winner){
+    const now = performance.now();
+    const elapsedSeconds = (now - generationStartTime) / 1000.0;
+
+    generationTimes.push(elapsedSeconds);
+    bestGenes = extractGenesFromRobot(winner);
+    generation++;
+
+    resetSimulation();
+    updateInfo();
+  }
+
+  drawChart();
+  requestAnimationFrame(loop);
+}
+
+/* ---------- Inicio ---------- */
+resetSimulation();
+updateInfo();
+loop();
+</script>
+</body>
+</html>

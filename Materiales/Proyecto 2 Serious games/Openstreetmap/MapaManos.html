@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OpenStreetMap + MediaPipe Hands Demo</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet"
+          href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin=""/>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+        #map {
+            width: 100%;
+            height: 100vh;
+        }
+        #webcam {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            width: 200px;
+            height: 150px;
+            border: 2px solid #333;
+            border-radius: 5px;
+            z-index: 1000;
+        }
+        #debugCanvas {
+            position: absolute;
+            bottom: 10px;
+            right: 220px;
+            width: 200px;
+            height: 150px;
+            border: 2px solid #333;
+            border-radius: 5px;
+            z-index: 1000;
+        }
+        #gestureStatus {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 1000;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="gestureStatus">Waiting for hand...</div>
+    <video id="webcam" class="input_video" autoplay playsinline muted></video>
+    <canvas id="debugCanvas"></canvas>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
+    <script>
+        // Initialize the map
+        const map = L.map('map', {
+            zoomSnap: 0,
+            zoomDelta: 0.5,
+            wheelDebounceTime: 0,
+            wheelPxPerZoomLevel: 120
+        }).setView([39.4759729, -0.418349], 13);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+        L.marker([39.4759729, -0.418349]).addTo(map)
+            .bindPopup('Valencia, Spain')
+            .openPopup();
+
+        const debugCanvas = document.getElementById('debugCanvas');
+        const debugCtx = debugCanvas.getContext('2d');
+        const gestureStatus = document.getElementById('gestureStatus');
+
+        // State
+        let isDragging = false;
+        let isZooming = false;
+        let lastHandX = 0;
+        let lastHandY = 0;
+        let filteredHandX = null;
+        let filteredHandY = null;
+        const dragSensitivity = 800;
+        const PAN_SMOOTHING = 0.25; // 0–1, lower = smoother
+
+        // ============ SMOOTH ZOOM SYSTEM ============
+        const zoomSensitivity = 8;
+
+        // Exponential moving average for distance smoothing
+        let smoothedDistance = 0;
+        let filteredDistance = null;
+        const DISTANCE_SMOOTHING = 0.12; // 0–1, lower = smoother
+
+        let initialZoomDistance = 0;
+        let initialZoomLevel = 0;
+
+        // Target zoom with interpolation
+        let targetZoom = 13;
+        let currentDisplayZoom = 13;
+        const ZOOM_LERP_FACTOR = 0.1;   // How fast to interpolate (0-1, lower = smoother)
+        const ZOOM_DEAD_ZONE = 0.01;    // Ignore tiny distance changes
+
+        // Animation loop for smooth zoom interpolation
+        function animateZoom() {
+            if (Math.abs(targetZoom - currentDisplayZoom) > 0.001) {
+                // Lerp towards target
+                currentDisplayZoom += (targetZoom - currentDisplayZoom) * ZOOM_LERP_FACTOR;
+
+                // Clamp to valid range
+                if (!isFinite(currentDisplayZoom)) {
+                    // hard reset if something went wrong
+                    currentDisplayZoom = map.getZoom();
+                    targetZoom = currentDisplayZoom;
+                }
+                currentDisplayZoom = Math.max(1, Math.min(18, currentDisplayZoom));
+
+                // Apply to map (disable Leaflet animation, we already interpolate)
+                map.setZoom(currentDisplayZoom, { animate: false });
+            }
+            requestAnimationFrame(animateZoom);
+        }
+        animateZoom();
+
+        // Get smoothed distance using exponential smoothing (low-pass filter)
+        function getSmoothedDistance(rawDistance) {
+            if (filteredDistance === null) {
+                filteredDistance = rawDistance;
+            } else {
+                filteredDistance += DISTANCE_SMOOTHING * (rawDistance - filteredDistance);
+            }
+            return filteredDistance;
+        }
+        // ============================================
+
+        // MediaPipe Hands setup
+        const videoElement = document.getElementById('webcam');
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${file}`
+        });
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults((results) => {
+            // Draw landmarks
+            debugCtx.clearRect(0, 0, debugCanvas.width, debugCanvas.height);
+            debugCtx.drawImage(results.image, 0, 0, debugCanvas.width, debugCanvas.height);
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    drawConnectors(debugCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                    drawLandmarks(debugCtx, landmarks, {radius: 2, color: '#FF0000'});
+                }
+            }
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const numHands = results.multiHandLandmarks.length;
+
+                // Check if hands are closed (thumb-index pinch)
+                const areHandsClosed = [];
+                for (let i = 0; i < numHands; i++) {
+                    const landmarks = results.multiHandLandmarks[i];
+                    const thumbTip = landmarks[4];
+                    const indexTip = landmarks[8];
+                    const distance = Math.sqrt(
+                        Math.pow(thumbTip.x - indexTip.x, 2) +
+                        Math.pow(thumbTip.y - indexTip.y, 2)
+                    );
+                    areHandsClosed.push(distance < 0.08);
+                }
+
+                // TWO HANDS CLOSED: Pinch to zoom
+                if (numHands === 2 && areHandsClosed[0] && areHandsClosed[1]) {
+                    const hand1 = results.multiHandLandmarks[0][4];
+                    const hand2 = results.multiHandLandmarks[1][4];
+
+                    const rawDistance = Math.sqrt(
+                        Math.pow(hand1.x - hand2.x, 2) +
+                        Math.pow(hand1.y - hand2.y, 2)
+                    );
+
+                    // Smoothed distance
+                    smoothedDistance = getSmoothedDistance(rawDistance);
+
+                    // Ensure we have a reasonable initial distance
+                    if (!isZooming) {
+                        isZooming = true;
+                        isDragging = false;
+
+                        if (!smoothedDistance || smoothedDistance <= 0) {
+                            // Avoid zero / invalid initial distance
+                            initialZoomDistance = 0.05;
+                        } else {
+                            initialZoomDistance = smoothedDistance;
+                        }
+
+                        initialZoomLevel = map.getZoom();
+                        targetZoom = initialZoomLevel;
+                        currentDisplayZoom = initialZoomLevel;
+
+                        gestureStatus.textContent = "🔍 ZOOM MODE";
+                    } else {
+                        // Compute zoom only if initial distance is valid
+                        if (initialZoomDistance > 0) {
+                            const distanceRatio = smoothedDistance / initialZoomDistance;
+                            const distanceDelta = smoothedDistance - initialZoomDistance;
+
+                            if (isFinite(distanceRatio) && distanceRatio > 0) {
+                                // Apply dead zone to prevent jitter
+                                if (Math.abs(distanceDelta) > ZOOM_DEAD_ZONE) {
+                                    // INVERTED LOGIC:
+                                    // Hands apart (ratio > 1) => zoom IN
+                                    // Hands together (ratio < 1) => zoom OUT
+                                    const zoomChange = Math.log2(distanceRatio) * zoomSensitivity;
+                                    let newTarget = initialZoomLevel + zoomChange;
+
+                                    if (!isFinite(newTarget)) {
+                                        // Guard against NaN / Infinity
+                                        newTarget = initialZoomLevel;
+                                    }
+
+                                    // Clamp the target zoom
+                                    targetZoom = Math.max(1, Math.min(18, newTarget));
+                                }
+
+                                gestureStatus.innerHTML =
+                                    `🔍 ZOOM: ${currentDisplayZoom.toFixed(2)}<br>` +
+                                    `Target: ${targetZoom.toFixed(2)}<br>` +
+                                    `Ratio: ${distanceRatio.toFixed(3)}`;
+                            }
+                        }
+                    }
+                }
+                // ONE HAND CLOSED: Drag to pan
+                else if (numHands >= 1 && areHandsClosed[0]) {
+                    const landmarks = results.multiHandLandmarks[0];
+                    const thumbTip = landmarks[4];
+
+                    if (!isDragging) {
+                        isDragging = true;
+                        isZooming = false;
+
+                        // Initialise hand filters
+                        filteredHandX = thumbTip.x;
+                        filteredHandY = thumbTip.y;
+                        lastHandX = filteredHandX;
+                        lastHandY = filteredHandY;
+
+                        // Reset zoom smoothing state
+                        filteredDistance = null;
+
+                        gestureStatus.textContent = "✋ DRAG MODE";
+                    } else {
+                        // Smooth hand position
+                        filteredHandX += PAN_SMOOTHING * (thumbTip.x - filteredHandX);
+                        filteredHandY += PAN_SMOOTHING * (thumbTip.y - filteredHandY);
+
+                        const deltaX = (filteredHandX - lastHandX) * dragSensitivity;
+                        const deltaY = (filteredHandY - lastHandY) * dragSensitivity;
+
+                        if (Math.abs(deltaX) > 1 || Math.abs(deltaY) > 1) {
+                            map.panBy([deltaX, -deltaY], { animate: false });
+                            gestureStatus.innerHTML =
+                                `✋ DRAG<br>` +
+                                `ΔX: ${deltaX.toFixed(1)} ΔY: ${deltaY.toFixed(1)}`;
+                        }
+
+                        lastHandX = filteredHandX;
+                        lastHandY = filteredHandY;
+                    }
+                } else {
+                    gestureStatus.textContent = "👋 Hand open";
+                    isDragging = false;
+                    isZooming = false;
+                    filteredDistance = null;
+                    filteredHandX = null;
+                    filteredHandY = null;
+                }
+            } else {
+                gestureStatus.textContent = "Waiting for hand...";
+                isDragging = false;
+                isZooming = false;
+                filteredDistance = null;
+                filteredHandX = null;
+                filteredHandY = null;
+            }
+        });
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 640,
+            height: 480
+        });
+        camera.start();
+    </script>
+</body>
+</html> 

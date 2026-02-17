@@ -55,19 +55,114 @@
             z-index: 1000;
             font-family: monospace;
         }
+
+        /* ===== DASHBOARD LATERAL ===== */
+        #dashboard {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 260px;
+            height: 100vh;
+            background: #1e1e1e;
+            color: white;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            box-shadow: 4px 0 15px rgba(0, 0, 0, 0.4);
+            z-index: 1000;
+        }
+
+        #dashboard h2 {
+            margin-top: 0;
+        }
+
+        #dashboard button {
+            width: 100%;
+            padding: 10px;
+            background: #00aaff;
+            border: none;
+            color: white;
+            cursor: pointer;
+            border-radius: 5px;
+            margin-top: 10px;
+            transition: 0.2s;
+        }
+
+        #dashboard button:hover {
+            background: #008ecc;
+        }
+
+        #map {
+            margin-left: 260px;
+            height: 100vh;
+        }
+
+        /* ===== PUNTO DE MIRA CENTRAL ===== */
+        /* ===== PUNTO DE MIRA CENTRAL CORRECTO ===== */
+        #map {
+            position: relative;
+            margin-left: 260px;
+            height: 100vh;
+        }
+
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 24px;
+            height: 24px;
+            pointer-events: none;
+            z-index: 500;
+        }
+
+        #crosshair::before,
+        #crosshair::after {
+            content: '';
+            position: absolute;
+            background: red;
+        }
+
+        #crosshair::before {
+            left: 50%;
+            top: 0;
+            width: 2px;
+            height: 24px;
+            transform: translateX(-50%);
+        }
+
+        #crosshair::after {
+            top: 50%;
+            left: 0;
+            height: 2px;
+            width: 24px;
+            transform: translateY(-50%);
+        }
     </style>
 </head>
 
 <body>
-    <div id="map"></div>
-    <div id="gestureStatus">Waiting for hand...</div>
+    <div id="dashboard">
+        <h2>🗺 Gesture Map</h2>
+        <p id="markerCounter">Marcadores creados: 0</p>
+        <button onclick="clearMarkers()">Limpiar marcadores</button>
+        <hr>
+        <p><strong>Gestos:</strong></p>
+        <p>✊ Puño → Crear marcador</p>
+        <p>🤏 Pinza → Arrastrar</p>
+        <p>🤏🤏 Dos manos → Zoom</p>
+    </div>
+
+    <div id="map">
+        <div id="crosshair"></div>
+    </div>
+    <div id="gestureStatus">Esperando mano...</div>
     <video id="webcam" class="input_video" autoplay playsinline muted></video>
     <canvas id="debugCanvas"></canvas>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script>
-        // Initialize the map
+        // Inicializamos el mapa
         const map = L.map('map', {
             zoomSnap: 0,
             zoomDelta: 0.5,
@@ -86,12 +181,14 @@
         const debugCtx = debugCanvas.getContext('2d');
         const gestureStatus = document.getElementById('gestureStatus');
 
-        // ===== NUEVO SISTEMA DE MARCADORES =====
+        // ===== SISTEMA DE MARCADORES =====
         let createdMarkers = [];
         let pinchStartTime = null;
+        let totalDistance = 0; // distancia total acumulada en metros
+        let routeLines = []; // líneas entre marcadores
         const PINCH_HOLD_TIME = 1000; // 1 segundo para crear marcador
 
-        // State
+        // ===== ESTADO
         let isDragging = false;
         let isZooming = false;
         let lastHandX = 0;
@@ -99,47 +196,42 @@
         let filteredHandX = null;
         let filteredHandY = null;
         const dragSensitivity = 800;
-        const PAN_SMOOTHING = 0.25; // 0–1, lower = smoother
+        const PAN_SMOOTHING = 0.25;
 
-        // ============ SMOOTH ZOOM SYSTEM ============
+        // ===== SISTEMA DE ZOOM SUAVIZADO =====
         const zoomSensitivity = 8;
 
-        // Exponential moving average for distance smoothing
         let smoothedDistance = 0;
         let filteredDistance = null;
-        const DISTANCE_SMOOTHING = 0.12; // 0–1, lower = smoother
+        const DISTANCE_SMOOTHING = 0.12;
 
         let initialZoomDistance = 0;
         let initialZoomLevel = 0;
 
-        // Target zoom with interpolation
         let targetZoom = 13;
         let currentDisplayZoom = 13;
-        const ZOOM_LERP_FACTOR = 0.1;   // How fast to interpolate (0-1, lower = smoother)
-        const ZOOM_DEAD_ZONE = 0.01;    // Ignore tiny distance changes
+        const ZOOM_LERP_FACTOR = 0.1;
+        const ZOOM_DEAD_ZONE = 0.01;    // Ignorar pequeñas distancias
 
-        // Animation loop for smooth zoom interpolation
+        // Animación continua para interpolar zoom suavemente
         function animateZoom() {
             if (Math.abs(targetZoom - currentDisplayZoom) > 0.001) {
-                // Lerp towards target
                 currentDisplayZoom += (targetZoom - currentDisplayZoom) * ZOOM_LERP_FACTOR;
 
-                // Clamp to valid range
+                // Limitar niveles de zoom válidos
                 if (!isFinite(currentDisplayZoom)) {
-                    // hard reset if something went wrong
                     currentDisplayZoom = map.getZoom();
                     targetZoom = currentDisplayZoom;
                 }
                 currentDisplayZoom = Math.max(1, Math.min(18, currentDisplayZoom));
 
-                // Apply to map (disable Leaflet animation, we already interpolate)
                 map.setZoom(currentDisplayZoom, { animate: false });
             }
             requestAnimationFrame(animateZoom);
         }
         animateZoom();
 
-        // Get smoothed distance using exponential smoothing (low-pass filter)
+        // Filtro exponencial para suavizar la distancia entre manos
         function getSmoothedDistance(rawDistance) {
             if (filteredDistance === null) {
                 filteredDistance = rawDistance;
@@ -148,9 +240,8 @@
             }
             return filteredDistance;
         }
-        // ============================================
 
-        // MediaPipe Hands setup
+        // ===== CONFIGURACIÓN DE MEDIAPIPE HANDS =====
         const videoElement = document.getElementById('webcam');
         const hands = new Hands({
             locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${file}`
@@ -161,8 +252,8 @@
             minDetectionConfidence: 0.5,
             minTrackingConfidence: 0.5
         });
-        
-        // ===== DETECCIÓN DE PUÑO =====
+
+        // ===== FUNCIÓN PARA DETECTAR PUÑO =====
         function isFist(landmarks) {
             const wrist = landmarks[0];
 
@@ -181,12 +272,12 @@
                     closedFingers++;
                 }
             });
-
-            return closedFingers >= 3; // al menos 3 dedos cerrados
+            // Consideramos puño si al menos 3 dedos están cerrados
+            return closedFingers >= 3;
         }
 
         hands.onResults((results) => {
-            // Draw landmarks
+            // Dibujar landmarks en el canvas
             debugCtx.clearRect(0, 0, debugCanvas.width, debugCanvas.height);
             debugCtx.drawImage(results.image, 0, 0, debugCanvas.width, debugCanvas.height);
             if (results.multiHandLandmarks) {
@@ -199,7 +290,7 @@
             if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
                 const numHands = results.multiHandLandmarks.length;
 
-                // Check if hands are closed (thumb-index pinch)
+                // Detectar pinza (índice + pulgar)
                 const areHandsClosed = [];
                 for (let i = 0; i < numHands; i++) {
                     const landmarks = results.multiHandLandmarks[i];
@@ -214,7 +305,7 @@
 
                 const fistDetected = isFist(results.multiHandLandmarks[0]);
 
-                // ===== PUÑO PARA CREAR MARCADOR =====
+                // ===== PUÑO: CREAR MARCADOR =====
                 if (numHands === 1 && fistDetected) {
                     if (!pinchStartTime) {
                         pinchStartTime = Date.now();
@@ -227,11 +318,11 @@
                         }
                     }
 
-                    gestureStatus.textContent = "✊ Puño - Creando marcador...";
+                    gestureStatus.textContent = "✊ PUÑO - CREANDO MARCADOR...";
                     return;
                 }
 
-                // TWO HANDS CLOSED: Pinch to zoom
+                // ===== DOS MANOS CON PINZA: ZOOM =====
                 if (numHands === 2 && areHandsClosed[0] && areHandsClosed[1]) {
                     const hand1 = results.multiHandLandmarks[0][4];
                     const hand2 = results.multiHandLandmarks[1][4];
@@ -241,16 +332,13 @@
                         Math.pow(hand1.y - hand2.y, 2)
                     );
 
-                    // Smoothed distance
                     smoothedDistance = getSmoothedDistance(rawDistance);
 
-                    // Ensure we have a reasonable initial distance
                     if (!isZooming) {
                         isZooming = true;
                         isDragging = false;
 
                         if (!smoothedDistance || smoothedDistance <= 0) {
-                            // Avoid zero / invalid initial distance
                             initialZoomDistance = 0.05;
                         } else {
                             initialZoomDistance = smoothedDistance;
@@ -260,9 +348,8 @@
                         targetZoom = initialZoomLevel;
                         currentDisplayZoom = initialZoomLevel;
 
-                        gestureStatus.textContent = "🔍 ZOOM MODE";
+                        gestureStatus.textContent = "🔍 MODO ZOOM";
                     } else {
-                        // Compute zoom only if initial distance is valid
                         if (initialZoomDistance > 0) {
                             const distanceRatio = smoothedDistance / initialZoomDistance;
                             const distanceDelta = smoothedDistance - initialZoomDistance;
@@ -270,18 +357,15 @@
                             if (isFinite(distanceRatio) && distanceRatio > 0) {
                                 // Apply dead zone to prevent jitter
                                 if (Math.abs(distanceDelta) > ZOOM_DEAD_ZONE) {
-                                    // INVERTED LOGIC:
-                                    // Hands apart (ratio > 1) => zoom IN
-                                    // Hands together (ratio < 1) => zoom OUT
+                                    // Hands separadas (ratio > 1) => zoom IN
+                                    // Hands juntas (ratio < 1) => zoom OUT
                                     const zoomChange = Math.log2(distanceRatio) * zoomSensitivity;
                                     let newTarget = initialZoomLevel + zoomChange;
 
                                     if (!isFinite(newTarget)) {
-                                        // Guard against NaN / Infinity
                                         newTarget = initialZoomLevel;
                                     }
 
-                                    // Clamp the target zoom
                                     targetZoom = Math.max(1, Math.min(18, newTarget));
                                 }
 
@@ -293,26 +377,26 @@
                         }
                     }
                 }
-                // ONE HAND CLOSED: Drag to pan
-                else if (numHands >= 1 && areHandsClosed[0] && !fistDetected) {                    const landmarks = results.multiHandLandmarks[0];
+                // ===== UNA MANO CON PINZA: ARRASTRAR =====
+                else if (numHands >= 1 && areHandsClosed[0] && !fistDetected) {
+                    const landmarks = results.multiHandLandmarks[0];
                     const thumbTip = landmarks[4];
 
                     if (!isDragging) {
                         isDragging = true;
                         isZooming = false;
 
-                        // Initialise hand filters
+                        // Inicializa filtros de mano
                         filteredHandX = thumbTip.x;
                         filteredHandY = thumbTip.y;
                         lastHandX = filteredHandX;
                         lastHandY = filteredHandY;
 
-                        // Reset zoom smoothing state
                         filteredDistance = null;
 
-                        gestureStatus.textContent = "✋ DRAG MODE";
+                        gestureStatus.textContent = "✋ MODO ARRASTRAR";
                     } else {
-                        // Smooth hand position
+
                         filteredHandX += PAN_SMOOTHING * (thumbTip.x - filteredHandX);
                         filteredHandY += PAN_SMOOTHING * (thumbTip.y - filteredHandY);
 
@@ -322,15 +406,16 @@
                         if (Math.abs(deltaX) > 1 || Math.abs(deltaY) > 1) {
                             map.panBy([deltaX, -deltaY], { animate: false });
                             gestureStatus.innerHTML =
-                                `✋ DRAG<br>` +
+                                `✋ ARRASTRAR<br>` +
                                 `ΔX: ${deltaX.toFixed(1)} ΔY: ${deltaY.toFixed(1)}`;
                         }
 
                         lastHandX = filteredHandX;
                         lastHandY = filteredHandY;
                     }
+                    // ===== MANO ABIERTA =====                    
                 } else {
-                    gestureStatus.textContent = "👋 Hand open";
+                    gestureStatus.textContent = "👋 MANO ABIERTA";
                     pinchStartTime = null;
                     isDragging = false;
                     isZooming = false;
@@ -338,8 +423,9 @@
                     filteredHandX = null;
                     filteredHandY = null;
                 }
+                // ===== SIN MANO DETECTADA =====
             } else {
-                gestureStatus.textContent = "Waiting for hand...";
+                gestureStatus.textContent = "ESPERANDO MANO...";
                 isDragging = false;
                 isZooming = false;
                 filteredDistance = null;
@@ -358,7 +444,59 @@
 
             createdMarkers.push(marker);
 
-            console.log("Marcadores creados:", createdMarkers.length);
+            if (createdMarkers.length > 1) {
+
+                const previousMarker = createdMarkers[createdMarkers.length - 2];
+
+                const latlng1 = previousMarker.getLatLng();
+                const latlng2 = marker.getLatLng();
+
+                // Dibujar línea
+                const line = L.polyline([latlng1, latlng2], {
+                    color: 'red',
+                    weight: 4
+                }).addTo(map);
+
+                routeLines.push(line);
+
+                // Calcular distancia real en metros
+                const distance = map.distance(latlng1, latlng2);
+
+                totalDistance += distance;
+
+                // Convertir a km
+                const distanceKm = (distance / 1000).toFixed(2);
+                const totalKm = (totalDistance / 1000).toFixed(2);
+
+                marker.bindPopup(
+                    `Marcador ${createdMarkers.length}<br>` +
+                    `Distancia desde anterior: ${distanceKm} km<br>` +
+                    `Distancia total: ${totalKm} km`
+                ).openPopup();
+            }
+
+            document.getElementById("markerCounter").textContent =
+                "Marcadores creados: " + createdMarkers.length +
+                " | Distancia total: " + (totalDistance / 1000).toFixed(2) + " km";
+        }
+
+        // ===== FUNCIÓN PARA LIMPIAR MARCADORES =====
+        function clearMarkers() {
+
+            createdMarkers.forEach(marker => {
+                map.removeLayer(marker);
+            });
+
+            routeLines.forEach(line => {
+                map.removeLayer(line);
+            });
+
+            createdMarkers = [];
+            routeLines = [];
+            totalDistance = 0;
+
+            document.getElementById("markerCounter").textContent =
+                "Marcadores creados: 0 | Distancia total: 0 km";
         }
 
         const camera = new Camera(videoElement, {
